@@ -92,6 +92,57 @@ class UniformThresholdVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
     class_type: type = UniformThresholdVelocityCommand
 
 
+class UniformLateralYawVelocityCommand(UniformThresholdVelocityCommand):
+    """Command generator that resamples until lateral or yaw velocity is non-zero."""
+
+    cfg: UniformLateralYawVelocityCommandCfg  # type: ignore
+
+    def _normalize_env_ids(self, env_ids: Sequence[int]) -> torch.Tensor:
+        """Convert env ids to a flat long tensor for consistent indexing."""
+        if isinstance(env_ids, torch.Tensor):
+            return env_ids.flatten().to(device=self.device, dtype=torch.long)
+        return torch.tensor(list(env_ids), device=self.device, dtype=torch.long)
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        """Resample velocity commands until |vy| or |wz| exceeds the threshold."""
+        pending_env_ids = self._normalize_env_ids(env_ids)
+        if pending_env_ids.numel() == 0:
+            return
+
+        for _ in range(self.cfg.max_resample_attempts):
+            super()._resample_command(pending_env_ids)
+            vy = torch.abs(self.vel_command_b[pending_env_ids, 1])
+            wz = torch.abs(self.vel_command_b[pending_env_ids, 2])
+            valid_mask = (vy > self.cfg.lateral_yaw_threshold) | (wz > self.cfg.lateral_yaw_threshold)
+            pending_env_ids = pending_env_ids[~valid_mask]
+            if pending_env_ids.numel() == 0:
+                return
+
+        use_lateral = torch.rand(pending_env_ids.numel(), device=self.device) > 0.5
+        lateral_sign = torch.where(torch.rand(pending_env_ids.numel(), device=self.device) > 0.5, 1.0, -1.0)
+        yaw_sign = torch.where(torch.rand(pending_env_ids.numel(), device=self.device) > 0.5, 1.0, -1.0)
+        lateral_cmd = lateral_sign * torch.clamp(
+            torch.abs(self.vel_command_b[pending_env_ids, 1]),
+            min=self.cfg.lateral_yaw_threshold,
+        )
+        yaw_cmd = yaw_sign * torch.clamp(
+            torch.abs(self.vel_command_b[pending_env_ids, 2]),
+            min=self.cfg.lateral_yaw_threshold,
+        )
+        self.vel_command_b[pending_env_ids, 1] = torch.where(use_lateral, lateral_cmd, 0.0)
+        self.vel_command_b[pending_env_ids, 2] = torch.where(use_lateral, 0.0, yaw_cmd)
+
+
+@configclass
+class UniformLateralYawVelocityCommandCfg(UniformThresholdVelocityCommandCfg):
+    """Configuration for commands with at least one non-zero lateral or yaw component."""
+
+    class_type: type = UniformLateralYawVelocityCommand
+
+    lateral_yaw_threshold: float = 0.1
+    max_resample_attempts: int = 100
+
+
 class DiscreteCommandController(CommandTerm):
     """
     Command generator that assigns discrete commands to environments.

@@ -287,7 +287,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "mass_distribution_params": (0.7, 1.3),
+            "mass_distribution_params": (0.9, 1.1),
             "operation": "scale",
             "recompute_inertia": True,
         },
@@ -380,7 +380,9 @@ class RewardsCfg:
 
     # Root penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=0.0)
+    lin_vel_y_l2 = RewTerm(func=mdp.lin_vel_y_l2, weight=0.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=0.0)
+    ang_vel_z_l2 = RewTerm(func=mdp.ang_vel_z_l2, weight=0.0)
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
     base_height_l2 = RewTerm(
         func=mdp.base_height_l2,
@@ -630,16 +632,16 @@ class RewardsCfg:
         },
     )
 
-    # feet_distance_xy_exp = RewTerm(
-    #     func=mdp.feet_distance_xy_exp,
-    #     weight=0.0,
-    #     params={
-    #         "std": math.sqrt(0.25),
-    #         "asset_cfg": SceneEntityCfg("robot", body_names=""),
-    #         "stance_length": float,
-    #         "stance_width": float,
-    #     },
-    # )
+    feet_distance_xy_exp = RewTerm(
+        func=mdp.feet_distance_xy_exp,
+        weight=0.0,
+        params={
+            "std": math.sqrt(0.25),
+            "asset_cfg": SceneEntityCfg("robot", body_names=""),
+            "stance_length": float,
+            "stance_width": float,
+        },
+    )
 
     upward = RewTerm(func=mdp.upward, weight=0.0)
 

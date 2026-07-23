@@ -4,6 +4,7 @@
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import NoiseModelWithAdditiveBiasCfg, UniformNoiseCfg
 
 import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
@@ -16,6 +17,15 @@ from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
 # Pre-defined configs
 ##
 from robot_lab.assets.unitree import UNITREE_GO2W_CFG  # isort: skip
+
+# Observation delay in policy steps (control_dt = sim.dt * decimation ≈ 0.02 s).
+_OBS_DELAY_MIN_LAG = 0
+_OBS_DELAY_MAX_LAG = 4  # up to ~80 ms
+# Constant per-episode additive gyro bias (rad/s), sampled at reset.
+_GYRO_BIAS_RANGE = (-0.05, 0.05)
+# Actuator PD gain scale DR relative to asset defaults (legs kp=50, kd=2).
+_ACTUATOR_STIFFNESS_SCALE = (0.8, 1.25)
+_ACTUATOR_DAMPING_SCALE = (0.8, 1.25)
 
 
 @configclass
@@ -96,16 +106,51 @@ class UnitreeGo2WRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
         self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
 
+        # Per-term delay (sampled in [_OBS_DELAY_MIN_LAG, _OBS_DELAY_MAX_LAG] at reset).
+        # Each term needs its own cfg instance (ObservationManager mutates cfg.func in place).
+        self.observations.policy.base_ang_vel.modifiers = [
+            mdp.DelayedObservationCfg(min_lag=_OBS_DELAY_MIN_LAG, max_lag=_OBS_DELAY_MAX_LAG)
+        ]
+        self.observations.policy.projected_gravity.modifiers = [
+            mdp.DelayedObservationCfg(min_lag=_OBS_DELAY_MIN_LAG, max_lag=_OBS_DELAY_MAX_LAG)
+        ]
+        self.observations.policy.joint_pos.modifiers = [
+            mdp.DelayedObservationCfg(min_lag=_OBS_DELAY_MIN_LAG, max_lag=_OBS_DELAY_MAX_LAG)
+        ]
+        self.observations.policy.joint_vel.modifiers = [
+            mdp.DelayedObservationCfg(min_lag=_OBS_DELAY_MIN_LAG, max_lag=_OBS_DELAY_MAX_LAG)
+        ]
+
+        # Keep step uniform noise and add a constant per-episode gyro bias.
+        self.observations.policy.base_ang_vel.noise = NoiseModelWithAdditiveBiasCfg(
+            noise_cfg=UniformNoiseCfg(n_min=-0.2, n_max=0.2, operation="add"),
+            bias_noise_cfg=UniformNoiseCfg(
+                n_min=_GYRO_BIAS_RANGE[0],
+                n_max=_GYRO_BIAS_RANGE[1],
+                operation="abs",
+            ),
+            sample_bias_per_component=True,
+        )
+
         # ------------------------------Actions------------------------------
         # reduce action scale
-        self.actions.joint_pos.scale = {".*_hip_joint": 0.125, "^(?!.*_hip_joint).*": 0.25}
-        self.actions.joint_vel.scale = 5.0
+        self.actions.joint_pos.scale = {".*_hip_joint": 0.25, "^(?!.*_hip_joint).*": 0.25}
+        self.actions.joint_vel.scale = 1.
         self.actions.joint_pos.clip = {".*": (-100.0, 100.0)}
         self.actions.joint_vel.clip = {".*": (-100.0, 100.0)}
         self.actions.joint_pos.joint_names = self.leg_joint_names
         self.actions.joint_vel.joint_names = self.wheel_joint_names
 
         # ------------------------------Events------------------------------
+        # Actuator PD gain DR (inherits event from velocity_env_cfg; tune range for Go2W).
+        self.events.randomize_actuator_gains.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=self.leg_joint_names
+        )
+        self.events.randomize_actuator_gains.params["stiffness_distribution_params"] = _ACTUATOR_STIFFNESS_SCALE
+        self.events.randomize_actuator_gains.params["damping_distribution_params"] = _ACTUATOR_DAMPING_SCALE
+        self.events.randomize_actuator_gains.params["operation"] = "scale"
+        self.events.randomize_actuator_gains.params["distribution"] = "uniform"
+
         self.events.randomize_reset_base.params = {
             "pose_range": {
                 "x": (-0.5, 0.5),

@@ -48,6 +48,51 @@ def track_ang_vel_z_exp(
     return reward
 
 
+def track_lin_vel_x_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Reward tracking of forward linear velocity command (x axis) using exponential kernel."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    lin_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 0] - asset.data.root_lin_vel_b[:, 0])
+    reward = torch.exp(-lin_vel_error / std**2)
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def track_lin_vel_y_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Reward tracking of lateral linear velocity command (y axis) using exponential kernel."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    lin_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 1] - asset.data.root_lin_vel_b[:, 1])
+    reward = torch.exp(-lin_vel_error / std**2)
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def run_still(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize joint velocities on non-wheel joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
+
+
+def similar_to_default(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize joint position deviation from default angles."""
+    return mdp.joint_deviation_l1(env, asset_cfg)
+
+
+def wheels_planted(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Penalize wheels that are not in contact with the ground."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = torch.norm(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :], dim=-1)
+    in_contact = forces > force_threshold
+    return (~in_contact).float().sum(dim=1)
+
+
 def track_lin_vel_xy_yaw_frame_exp(
     env, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -299,6 +344,30 @@ def action_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_join
         )
         reward += diff
     reward *= 1 / len(mirror_joints) if len(mirror_joints) > 0 else 0
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def joint_pos_imbalance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, joint_groups: list[list[str]]) -> torch.Tensor:
+    """Penalize variance in joint positions within each group (e.g. across four legs)."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    if not hasattr(env, "joint_pos_imbalance_cache"):
+        env.joint_pos_imbalance_cache = {}
+
+    reward = torch.zeros(env.num_envs, device=env.device)
+    for joint_group in joint_groups:
+        cache_key = tuple(joint_group)
+        if cache_key not in env.joint_pos_imbalance_cache:
+            env.joint_pos_imbalance_cache[cache_key] = [asset.find_joints(joint_name) for joint_name in joint_group]
+        resolved = env.joint_pos_imbalance_cache[cache_key]
+        if len(resolved) < 2:
+            continue
+
+        joint_pos = torch.stack([asset.data.joint_pos[:, joint[0]] for joint in resolved], dim=1)
+        mean_pos = torch.mean(joint_pos, dim=1, keepdim=True)
+        variance = torch.mean(torch.square(joint_pos - mean_pos), dim=1)
+        reward += variance.squeeze()
+    reward *= 1 / len(joint_groups) if len(joint_groups) > 0 else 0
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
@@ -653,11 +722,59 @@ def lin_vel_z_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntity
     return reward
 
 
+def lin_vel_y_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize y-axis base linear velocity using L2 squared kernel."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.square(asset.data.root_lin_vel_b[:, 1])
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
 def ang_vel_xy_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize xy-axis base angular velocity using L2 squared kernel."""
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     reward = torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=1)
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def lin_acc_z_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize z-axis base linear acceleration in world frame using L2 squared kernel."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    reward = torch.sum(torch.square(asset.data.body_lin_acc_w[:, asset_cfg.body_ids, 2]), dim=1)
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def ang_acc_xy_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize xy-axis base angular acceleration in world frame using L2 squared kernel."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    reward = torch.sum(torch.square(asset.data.body_ang_acc_w[:, asset_cfg.body_ids, :2]), dim=(1, 2))
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def ang_vel_x_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize x-axis base angular velocity using L2 squared kernel."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.square(asset.data.root_ang_vel_b[:, 0])
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def ang_vel_y_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize y-axis base angular velocity using L2 squared kernel."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.square(asset.data.root_ang_vel_b[:, 1])
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def ang_vel_z_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize z-axis base angular velocity (yaw) using L2 squared kernel."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    reward = torch.square(asset.data.root_ang_vel_b[:, 2])
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 

@@ -46,3 +46,17 @@ class UnitreeGo2WRoughTrainerCfg(TrainerCfg):
 class UnitreeGo2WFlatTrainerCfg(UnitreeGo2WRoughTrainerCfg):
     max_iterations = 5000
     experiment_name = "unitree_go2w_flat"
+
+
+@dataclass
+class UnitreeGo2WFlatWheelsTrainerCfg(UnitreeGo2WFlatTrainerCfg):
+    experiment_name = "unitree_go2w_flat_wheels"
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.agent_factory.optimizer_factory.defaults["lr"] = 2.0e-3
+
+
+@dataclass
+class UnitreeGo2WFlatLegsTrainerCfg(UnitreeGo2WFlatTrainerCfg):
+    experiment_name = "unitree_go2w_flat_legs"

@@ -95,3 +95,65 @@ def command_levels_ang_vel(
             base_velocity_ranges.ang_vel_z = new_ang_vel_z.tolist()
 
     return torch.tensor(base_velocity_ranges.ang_vel_z[1], device=env.device)
+
+
+def reward_weight_linear_decay(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    target_weight: float,
+    start_scale: float = 1.5,
+    num_iterations: int = 500,
+    steps_per_iteration: int = 24,
+) -> float:
+    """Linearly decay a reward term weight from ``start_scale * target_weight`` to ``target_weight``.
+
+    The schedule is indexed by PPO learning iterations via ``env.common_step_counter`` and
+    ``steps_per_iteration`` (typically ``num_steps_per_env`` from the runner config).
+    """
+    del env_ids  # unused; curriculum is shared across all parallel environments
+
+    num_steps = num_iterations * steps_per_iteration
+    if env.common_step_counter >= num_steps:
+        scale = 1.0
+    else:
+        progress = env.common_step_counter / num_steps
+        scale = start_scale + (1.0 - start_scale) * progress
+
+    weight = target_weight * scale
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    if term_cfg.weight != weight:
+        term_cfg.weight = weight
+        env.reward_manager.set_term_cfg(term_name, term_cfg)
+
+    return weight
+
+
+def reward_weight_linear_ramp(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    target_weight: float,
+    num_iterations: int = 500,
+    steps_per_iteration: int = 24,
+) -> float:
+    """Linearly ramp a reward term weight from 0 to ``target_weight``.
+
+    The schedule is indexed by PPO learning iterations via ``env.common_step_counter`` and
+    ``steps_per_iteration`` (typically ``num_steps_per_env`` from the runner config).
+    """
+    del env_ids  # unused; curriculum is shared across all parallel environments
+
+    num_steps = num_iterations * steps_per_iteration
+    if env.common_step_counter >= num_steps:
+        scale = 1.0
+    else:
+        scale = env.common_step_counter / num_steps
+
+    weight = target_weight * scale
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    if term_cfg.weight != weight:
+        term_cfg.weight = weight
+        env.reward_manager.set_term_cfg(term_name, term_cfg)
+
+    return weight
