@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,8 +20,34 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def _tracking_std_with_command_transition(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    transition_std_scale: float = 1.0,
+    transition_duration_s: float = 0.0,
+) -> torch.Tensor | float:
+    """Return per-env tracking std, optionally scaled after command resamples."""
+    if transition_std_scale == 1.0 or transition_duration_s <= 0.0:
+        return std
+
+    cmd_term = env.command_manager.get_term(command_name)
+    time_since_resample = getattr(cmd_term, "time_since_resample", None)
+    if time_since_resample is None:
+        return std
+
+    in_transition = time_since_resample <= transition_duration_s
+    scale = torch.where(in_transition, transition_std_scale, 1.0)
+    return std * scale
+
+
 def track_lin_vel_xy_exp(
-    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    transition_std_scale: float = 1.0,
+    transition_duration_s: float = 0.0,
 ) -> torch.Tensor:
     """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
     # extract the used quantities (to enable type-hinting)
@@ -30,31 +57,50 @@ def track_lin_vel_xy_exp(
         torch.square(env.command_manager.get_command(command_name)[:, :2] - asset.data.root_lin_vel_b[:, :2]),
         dim=1,
     )
-    reward = torch.exp(-lin_vel_error / std**2)
+    std_eff = _tracking_std_with_command_transition(
+        env, std, command_name, transition_std_scale, transition_duration_s
+    )
+    reward = torch.exp(-lin_vel_error / std_eff**2)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
 
 def track_ang_vel_z_exp(
-    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    transition_std_scale: float = 1.0,
+    transition_duration_s: float = 0.0,
 ) -> torch.Tensor:
     """Reward tracking of angular velocity commands (yaw) using exponential kernel."""
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     # compute the error
     ang_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_b[:, 2])
-    reward = torch.exp(-ang_vel_error / std**2)
+    std_eff = _tracking_std_with_command_transition(
+        env, std, command_name, transition_std_scale, transition_duration_s
+    )
+    reward = torch.exp(-ang_vel_error / std_eff**2)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
 
 def track_lin_vel_x_exp(
-    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    transition_std_scale: float = 1.0,
+    transition_duration_s: float = 0.0,
 ) -> torch.Tensor:
     """Reward tracking of forward linear velocity command (x axis) using exponential kernel."""
     asset: RigidObject = env.scene[asset_cfg.name]
     lin_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 0] - asset.data.root_lin_vel_b[:, 0])
-    reward = torch.exp(-lin_vel_error / std**2)
+    std_eff = _tracking_std_with_command_transition(
+        env, std, command_name, transition_std_scale, transition_duration_s
+    )
+    reward = torch.exp(-lin_vel_error / std_eff**2)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
@@ -76,6 +122,22 @@ def run_still(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg
     return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
 
 
+def wheel_speed_zero_vx_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    vx_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize wheel joint speed when the forward velocity command is near zero.
+
+    Returns the sum of absolute wheel joint velocities, gated by ``|vx| < vx_threshold``.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_speed = torch.sum(torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
+    vx_abs = torch.abs(env.command_manager.get_command(command_name)[:, 0])
+    return wheel_speed * (vx_abs < vx_threshold).float()
+
+
 def similar_to_default(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize joint position deviation from default angles."""
     return mdp.joint_deviation_l1(env, asset_cfg)
@@ -91,6 +153,61 @@ def wheels_planted(
     forces = torch.norm(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :], dim=-1)
     in_contact = forces > force_threshold
     return (~in_contact).float().sum(dim=1)
+
+
+def wheel_traction_loss(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    joint_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    wheel_radius: float = 0.086,
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Penalize longitudinal wheel slip when wheels are in ground contact.
+
+    Uses a non-spinning rolling frame: axle = body +Y in world (Go2W wheel joint
+    axis), forward = normalize(axle × world_up). Slip is hub speed along forward
+    minus ``joint_vel * wheel_radius``. Only active for wheels whose contact force
+    exceeds ``force_threshold``.
+
+    Note: ``asset_cfg`` body order and ``joint_cfg`` joint order must match
+    (set ``preserve_order=True`` on both).
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contacts = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0]
+        > force_threshold
+    )
+    asset: Articulation = env.scene[asset_cfg.name]
+    num_wheels = len(asset_cfg.body_ids)
+    num_envs = env.num_envs
+
+    # Horizontal hub velocity in world.
+    wheel_vel_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :].clone()
+    wheel_vel_w[..., 2] = 0.0
+
+    # Axle direction from body +Y. Spin about Y leaves this axis fixed in world
+    # (unlike body +X, which tumbles with the tire).
+    wheel_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids, :]
+    axle_local = torch.zeros(num_envs, num_wheels, 3, device=env.device)
+    axle_local[..., 1] = 1.0
+    axle_w = math_utils.quat_apply(wheel_quat_w.reshape(-1, 4), axle_local.reshape(-1, 3)).reshape(
+        num_envs, num_wheels, 3
+    )
+
+    # forward = axle × world_up lies in the ground plane; with this sign,
+    # zero-slip rolling satisfies v_long ≈ ω * r (right-hand rule about +Y).
+    world_up = torch.zeros_like(axle_w)
+    world_up[..., 2] = 1.0
+    forward_w = math_utils.normalize(torch.cross(axle_w, world_up, dim=-1))
+
+    v_long = torch.sum(wheel_vel_w * forward_w, dim=-1)
+    joint_vel = asset.data.joint_vel[:, joint_cfg.joint_ids]
+    longitudinal_slip = v_long - joint_vel * wheel_radius
+    slip = torch.square(longitudinal_slip)
+    penalty = torch.sum(slip * contacts.float(), dim=1)
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return penalty
 
 
 def track_lin_vel_xy_yaw_frame_exp(
@@ -156,20 +273,51 @@ def joint_pos_penalty(
     stand_still_scale: float,
     velocity_threshold: float,
     command_threshold: float,
+    full_stand_still_scale: float | None = None,
 ) -> torch.Tensor:
-    """Penalize joint position error from default on the articulation."""
+    """Penalize L1 joint position error from default on the articulation.
+
+    If ``full_stand_still_scale`` is set, scaling is per-axis on
+    ``base_velocity = [vx, vy, yaw]``:
+
+    * ``stand_still_scale`` when ``|vy|`` and ``|yaw|`` are below ``command_threshold``
+    * ``full_stand_still_scale`` when ``|vx|``, ``|vy|``, and ``|yaw|`` are all below it
+
+    Otherwise the original gate is used: ``stand_still_scale`` only when the L2
+    command norm and planar body speed are both below threshold.
+    """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
-    cmd = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1)
-    body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
-    running_reward = torch.linalg.norm(
-        (asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]), dim=1
+    command = env.command_manager.get_command(command_name)
+    running_reward = torch.sum(
+        torch.abs(
+            asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+        ),
+        dim=1,
     )
-    reward = torch.where(
-        torch.logical_or(cmd > command_threshold, body_vel > velocity_threshold),
-        running_reward,
-        stand_still_scale * running_reward,
-    )
+    if full_stand_still_scale is None:
+        cmd = torch.linalg.norm(command, dim=1)
+        body_vel = torch.linalg.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+        reward = torch.where(
+            torch.logical_or(cmd > command_threshold, body_vel > velocity_threshold),
+            running_reward,
+            stand_still_scale * running_reward,
+        )
+    else:
+        vx_still = torch.abs(command[:, 0]) < command_threshold
+        vy_still = torch.abs(command[:, 1]) < command_threshold
+        yaw_still = torch.abs(command[:, 2]) < command_threshold
+        lat_yaw_still = vy_still & yaw_still
+        scale = torch.where(
+            lat_yaw_still & vx_still,
+            torch.full_like(running_reward, full_stand_still_scale),
+            torch.where(
+                lat_yaw_still,
+                torch.full_like(running_reward, stand_still_scale),
+                torch.ones_like(running_reward),
+            ),
+        )
+        reward = scale * running_reward
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 
@@ -656,22 +804,30 @@ def feet_slide(
     return reward
 
 
-# def smoothness_1(env: ManagerBasedRLEnv) -> torch.Tensor:
-#     # Penalize changes in actions
-#     diff = torch.square(env.action_manager.action - env.action_manager.prev_action)
-#     diff = diff * (env.action_manager.prev_action[:, :] != 0)  # ignore first step
-#     return torch.sum(diff, dim=1)
+class ActionSmoothnessL2(ManagerTermBase):
+    """Penalize second-order action changes (discrete acceleration) using L2 squared kernel."""
 
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._prev_prev_action = torch.zeros(
+            env.num_envs, env.action_manager.total_action_dim, device=env.device
+        )
 
-# def smoothness_2(env: ManagerBasedRLEnv) -> torch.Tensor:
-#     # Penalize changes in actions
-#     diff = torch.square(
-#         env.action_manager.action - 2 * env.action_manager.prev_action
-#         + env.action_manager.prev_prev_action
-#     )
-#     diff = diff * (env.action_manager.prev_action[:, :] != 0)  # ignore first step
-#     diff = diff * (env.action_manager.prev_prev_action[:, :] != 0)  # ignore second step
-#     return torch.sum(diff, dim=1)
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            self._prev_prev_action.zero_()
+        else:
+            self._prev_prev_action[env_ids] = 0.0
+
+    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        action = env.action_manager.action
+        prev_action = env.action_manager.prev_action
+        diff = torch.square(action - 2.0 * prev_action + self._prev_prev_action)
+        diff = diff * (prev_action != 0)  # ignore first step
+        diff = diff * (self._prev_prev_action != 0)  # ignore second step
+        penalty = torch.sum(diff, dim=1)
+        self._prev_prev_action[:] = prev_action
+        return penalty
 
 
 def upward(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -751,6 +907,14 @@ def ang_acc_xy_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntit
     """Penalize xy-axis base angular acceleration in world frame using L2 squared kernel."""
     asset: Articulation = env.scene[asset_cfg.name]
     reward = torch.sum(torch.square(asset.data.body_ang_acc_w[:, asset_cfg.body_ids, :2]), dim=(1, 2))
+    reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward
+
+
+def ang_acc_z_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize z-axis base angular acceleration in world frame using L2 squared kernel."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    reward = torch.sum(torch.square(asset.data.body_ang_acc_w[:, asset_cfg.body_ids, 2]), dim=1)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
 

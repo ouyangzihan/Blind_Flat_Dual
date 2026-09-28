@@ -39,12 +39,20 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
         super().__init__(cfg, env)
         # Track which robots were on pit terrain in the previous step
         self.was_on_pit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Elapsed time since the last command resample (used by velocity-tracking rewards).
+        self.time_since_resample = torch.zeros(self.num_envs, device=self.device)
+
+    def compute(self, dt: float):
+        """Update commands and advance the post-resample timer."""
+        super().compute(dt)
+        self.time_since_resample += dt
 
     def _resample_command(self, env_ids: Sequence[int]):
         """Resample velocity commands with threshold."""
         super()._resample_command(env_ids)
         # set small commands to zero
         self.vel_command_b[env_ids, :2] *= (torch.norm(self.vel_command_b[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
+        self.time_since_resample[env_ids] = 0.0
 
     def _update_command(self):
         """Update commands and apply terrain-aware restrictions in real-time.
@@ -141,6 +149,147 @@ class UniformLateralYawVelocityCommandCfg(UniformThresholdVelocityCommandCfg):
 
     lateral_yaw_threshold: float = 0.1
     max_resample_attempts: int = 100
+
+
+class DualFinetuneVelocityCommand(UniformThresholdVelocityCommand):
+    """Per-axis mixture velocity commands for wheels dual-finetune.
+
+    ``vx`` and ``vy``/``yaw`` use different mixture probabilities (see cfg). Components
+    with ``|value| <= deadzone`` are hard-set to 0. Legs-mode (``|vy|`` or ``|wz|``
+    above deadzone) uses a short command lifetime; otherwise a longer wheels lifetime.
+    When ``zero_lateral_yaw_on_episode_start`` is True, the first command of each
+    episode forces ``vy=0`` and ``wz=0`` (wheels-only start).
+    """
+
+    cfg: DualFinetuneVelocityCommandCfg  # type: ignore
+
+    def _normalize_env_ids(self, env_ids: Sequence[int]) -> torch.Tensor:
+        if isinstance(env_ids, torch.Tensor):
+            return env_ids.flatten().to(device=self.device, dtype=torch.long)
+        return torch.tensor(list(env_ids), device=self.device, dtype=torch.long)
+
+    def _sample_axis(
+        self,
+        num: int,
+        value_min: float,
+        value_max: float,
+        *,
+        prob_zero: float,
+        prob_max: float,
+        prob_min: float,
+    ) -> torch.Tensor:
+        """Sample one command axis for ``num`` envs with the given mixture."""
+        u = torch.rand(num, device=self.device)
+        out = torch.empty(num, device=self.device)
+        zero_mask = u < prob_zero
+        out[zero_mask] = 0.0
+        max_mask = (u >= prob_zero) & (u < prob_zero + prob_max)
+        out[max_mask] = value_max
+        min_lo = prob_zero + prob_max
+        min_mask = (u >= min_lo) & (u < min_lo + prob_min)
+        out[min_mask] = value_min
+        rand_mask = u >= (min_lo + prob_min)
+        if rand_mask.any():
+            out[rand_mask] = torch.empty(int(rand_mask.sum().item()), device=self.device).uniform_(
+                value_min, value_max
+            )
+        # Hard-zero near-zero values so they match play_dual deadzone.
+        out = torch.where(out.abs() <= self.cfg.command_deadzone, torch.zeros_like(out), out)
+        return out
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        env_ids_t = self._normalize_env_ids(env_ids)
+        if env_ids_t.numel() == 0:
+            return
+
+        n = env_ids_t.numel()
+        # No explicit standing reservation: standing happens when all axes are zero.
+        self.is_standing_env[env_ids_t] = False
+        if self.cfg.heading_command:
+            self.is_heading_env[env_ids_t] = False
+
+        self.vel_command_b[env_ids_t, 0] = self._sample_axis(
+            n,
+            *self.cfg.ranges.lin_vel_x,
+            prob_zero=self.cfg.vx_prob_zero,
+            prob_max=self.cfg.vx_prob_max,
+            prob_min=self.cfg.vx_prob_min,
+        )
+        self.vel_command_b[env_ids_t, 1] = self._sample_axis(
+            n,
+            *self.cfg.ranges.lin_vel_y,
+            prob_zero=self.cfg.lateral_yaw_prob_zero,
+            prob_max=self.cfg.lateral_yaw_prob_max,
+            prob_min=self.cfg.lateral_yaw_prob_min,
+        )
+        self.vel_command_b[env_ids_t, 2] = self._sample_axis(
+            n,
+            *self.cfg.ranges.ang_vel_z,
+            prob_zero=self.cfg.lateral_yaw_prob_zero,
+            prob_max=self.cfg.lateral_yaw_prob_max,
+            prob_min=self.cfg.lateral_yaw_prob_min,
+        )
+
+        # Episode reset zeros ``command_counter`` before ``_resample``; mid-episode
+        # resamples already have counter >= 1. Force wheels-only (vy=wz=0) at start.
+        if self.cfg.zero_lateral_yaw_on_episode_start:
+            episode_start = self.command_counter[env_ids_t] == 0
+            if episode_start.any():
+                start_ids = env_ids_t[episode_start]
+                self.vel_command_b[start_ids, 1] = 0.0
+                self.vel_command_b[start_ids, 2] = 0.0
+
+        # Legs-mode (nonzero vy or yaw after deadzone) → short lifetime; else wheels 2–3 s.
+        vy = torch.abs(self.vel_command_b[env_ids_t, 1])
+        wz = torch.abs(self.vel_command_b[env_ids_t, 2])
+        is_legs = (vy > self.cfg.command_deadzone) | (wz > self.cfg.command_deadzone)
+        time_left = torch.full(
+            (n,),
+            self.cfg.legs_command_duration_s,
+            device=self.device,
+            dtype=self.time_left.dtype,
+        )
+        wheels_mask = ~is_legs
+        num_wheels = int(wheels_mask.sum().item())
+        if num_wheels > 0:
+            time_left[wheels_mask] = torch.empty(
+                num_wheels, device=self.device, dtype=self.time_left.dtype
+            ).uniform_(*self.cfg.wheels_command_duration_range)
+        self.time_left[env_ids_t] = time_left
+
+
+@configclass
+class DualFinetuneVelocityCommandCfg(UniformThresholdVelocityCommandCfg):
+    """Configuration for dual-finetune per-axis mixture velocity commands."""
+
+    class_type: type = DualFinetuneVelocityCommand
+
+    rel_standing_envs: float = 0.0
+    """Disabled; standing arises when vx=vy=yaw are all zero after deadzone."""
+
+    # Forward velocity (vx): favor nonzero / endpoint commands for wheels training.
+    vx_prob_zero: float = 0.25
+    vx_prob_max: float = 0.30
+    vx_prob_min: float = 0.30
+    # Remaining mass (0.15) is uniform in range.
+
+    # Lateral / yaw (vy, wz): mostly zero so wheels mode dominates; short legs bursts.
+    lateral_yaw_prob_zero: float = 0.70
+    lateral_yaw_prob_max: float = 0.12
+    lateral_yaw_prob_min: float = 0.12
+    # Remaining mass (0.10) is uniform in range.
+
+    command_deadzone: float = 0.05
+    """Hard-zero |component| at or below this; also defines legs-mode (|vy| or |wz| above)."""
+
+    zero_lateral_yaw_on_episode_start: bool = True
+    """If True, force ``vy=0`` and ``wz=0`` on the first command of each episode."""
+
+    legs_command_duration_s: float = 1.0
+    """Resample interval when |vy| or |wz| exceeds ``command_deadzone``."""
+
+    wheels_command_duration_range: tuple[float, float] = (2.0, 3.0)
+    """Resample interval range when the command is wheels-only or standing."""
 
 
 class DiscreteCommandController(CommandTerm):

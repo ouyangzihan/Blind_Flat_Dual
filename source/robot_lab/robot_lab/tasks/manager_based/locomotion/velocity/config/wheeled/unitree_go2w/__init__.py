@@ -27,6 +27,9 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_wheels_env_cfg:UnitreeGo2WFlatWheelsEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2WFlatWheelsPPORunnerCfg",
+        "rsl_rl_with_symmetry_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2WFlatWheelsPPORunnerWithSymmetryCfg"
+        ),
         "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeGo2WFlatWheelsTrainerCfg",
     },
 )
@@ -38,7 +41,27 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_legs_env_cfg:UnitreeGo2WFlatLegsEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2WFlatLegsPPORunnerCfg",
+        "rsl_rl_with_symmetry_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2WFlatLegsPPORunnerWithSymmetryCfg"
+        ),
         "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:UnitreeGo2WFlatLegsTrainerCfg",
+    },
+)
+
+gym.register(
+    id="RobotLab-Isaac-Velocity-Flat-Unitree-Go2W-Wheels-DualFinetune-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.flat_wheels_dual_finetune_env_cfg:UnitreeGo2WFlatWheelsDualFinetuneEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2WFlatWheelsDualFinetunePPORunnerCfg"
+        ),
+        "rsl_rl_with_symmetry_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2WFlatWheelsDualFinetunePPORunnerWithSymmetryCfg"
+        ),
     },
 )
 

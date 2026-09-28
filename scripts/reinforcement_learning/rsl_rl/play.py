@@ -80,7 +80,6 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
-from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
@@ -138,19 +137,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.curriculum.command_levels_lin_vel = None
     env_cfg.curriculum.command_levels_ang_vel = None
 
+    controller = None
     if args_cli.keyboard:
         env_cfg.scene.num_envs = 1
         env_cfg.terminations.time_out = None
         env_cfg.commands.base_velocity.debug_vis = False
+        env_cfg.commands.base_velocity.resampling_time_range = (1.0e9, 1.0e9)
+        if getattr(env_cfg.commands, "gait_behavior", None) is not None:
+            env_cfg.commands.gait_behavior.resampling_time_range = (1.0e9, 1.0e9)
         config = Se2KeyboardCfg(
             v_x_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_x[1],
             v_y_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_y[1],
             omega_z_sensitivity=env_cfg.commands.base_velocity.ranges.ang_vel_z[1],
         )
         controller = Se2Keyboard(config)
-        env_cfg.observations.policy.velocity_commands = ObsTerm(
-            func=lambda env: torch.tensor(controller.advance(), dtype=torch.float32).unsqueeze(0).to(env.device),
-        )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -242,6 +242,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            if controller is not None:
+                command = torch.tensor(controller.advance(), dtype=torch.float32, device=env.unwrapped.device)
+                env.unwrapped.command_manager.get_command("base_velocity")[:] = command
             # agent stepping
             actions = policy(obs)
             # env stepping

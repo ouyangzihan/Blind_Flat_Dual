@@ -38,3 +38,9 @@ _build
 
 # LSP
 pyrightconfig.json
+
+# Local data kept off the published repo
+/Reference/
+/docs/imgs/
+/logs/
+/outputs/

@@ -34,6 +34,15 @@ class GaitBehaviorCommand(CommandTerm):
         8: body roll
         9: stance width
         10: stance length
+
+    When ``velocity_command_name`` is set, frequency tracks ``|vy|`` and ``|yaw|``
+    each step: ``freq = frequency_base * (1 + |vy| * frequency_vy_scale + |yaw| *
+    frequency_yaw_scale)``. ``frequency_base`` may be a scalar or a ``(lo, hi)``
+    range resampled per env. Yaw is commanded angular velocity in rad/s.
+
+    When ``enable_planted_gait`` is set and ``|vy|`` and ``|yaw|`` are both below
+    ``cmd_threshold``, footswing height is forced to 0 and desired contacts are
+    all stance so WTW contact/clearance terms keep wheels on the ground.
     """
 
     cfg: GaitBehaviorCommandCfg
@@ -44,11 +53,22 @@ class GaitBehaviorCommand(CommandTerm):
         self.gait_indices = torch.zeros(self.num_envs, device=self.device)
         self.foot_indices = torch.zeros(self.num_envs, 4, device=self.device)
         self.desired_contact_states = torch.zeros(self.num_envs, 4, device=self.device)
+        # Resampled / curriculum footswing; restored when leaving planted mode.
+        self._nominal_footswing = torch.zeros(self.num_envs, device=self.device)
+        # Per-env gait frequency at |vy|=0, |yaw|=0; resampled with the command.
+        freq_lo, freq_hi = _frequency_base_range(cfg)
+        self._frequency_base = torch.full((self.num_envs,), 0.5 * (freq_lo + freq_hi), device=self.device)
+        self.is_planted_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._smoothing_cdf = Normal(0.0, self.cfg.kappa_gait_probs).cdf
 
     @property
     def command(self) -> torch.Tensor:
         return self._command
+
+    @property
+    def frequency_base(self) -> torch.Tensor:
+        """Per-env gait frequency at ``|vy|=0``, ``|yaw|=0`` (Hz)."""
+        return self._frequency_base
 
     def _update_metrics(self):
         pass
@@ -61,9 +81,11 @@ class GaitBehaviorCommand(CommandTerm):
         self._command[env_ids_t, 0] = sample_uniform(
             ranges.body_height[0], ranges.body_height[1], (len(env_ids),), device=self.device
         )
-        self._command[env_ids_t, 1] = sample_uniform(
-            ranges.frequency[0], ranges.frequency[1], (len(env_ids),), device=self.device
+        freq_lo, freq_hi = _frequency_base_range(self.cfg)
+        self._frequency_base[env_ids_t] = sample_uniform(
+            freq_lo, freq_hi, (len(env_ids),), device=self.device
         )
+        self._command[env_ids_t, 1] = self._frequency_base[env_ids_t]
         self._command[env_ids_t, 2] = sample_uniform(
             ranges.phase[0], ranges.phase[1], (len(env_ids),), device=self.device
         )
@@ -79,6 +101,7 @@ class GaitBehaviorCommand(CommandTerm):
         self._command[env_ids_t, 6] = sample_uniform(
             ranges.footswing_height[0], ranges.footswing_height[1], (len(env_ids),), device=self.device
         )
+        self._nominal_footswing[env_ids_t] = self._command[env_ids_t, 6]
         self._command[env_ids_t, 7] = sample_uniform(
             ranges.body_pitch[0], ranges.body_pitch[1], (len(env_ids),), device=self.device
         )
@@ -93,7 +116,32 @@ class GaitBehaviorCommand(CommandTerm):
         )
         self.gait_indices[env_ids_t] = 0.0
 
+    def _sync_velocity_modulated_params(self):
+        """Update frequency / footswing / planted flag from the velocity command."""
+        self._command[:, 6] = self._nominal_footswing
+        self.is_planted_env[:] = False
+        if self.cfg.velocity_command_name is None:
+            return
+
+        vel_cmd = self._env.command_manager.get_command(self.cfg.velocity_command_name)
+        vy_abs = torch.abs(vel_cmd[:, 1])
+        yaw_abs = torch.abs(vel_cmd[:, 2])
+
+        # freq = base * (1 + |vy| * vy_scale + |yaw| * yaw_scale); base is resampled per env.
+        self._command[:, 1] = self._frequency_base * (
+            1 + vy_abs * self.cfg.frequency_vy_scale + yaw_abs * self.cfg.frequency_yaw_scale
+        )
+
+        if not self.cfg.enable_planted_gait:
+            return
+
+        planted = (vy_abs < self.cfg.cmd_threshold) & (yaw_abs < self.cfg.cmd_threshold)
+        self.is_planted_env[:] = planted
+        self._command[:, 6] = torch.where(planted, torch.zeros_like(self._nominal_footswing), self._nominal_footswing)
+
     def _update_command(self):
+        self._sync_velocity_modulated_params()
+
         frequencies = self._command[:, 1]
         phases = self._command[:, 2]
         offsets = self._command[:, 3]
@@ -134,6 +182,19 @@ class GaitBehaviorCommand(CommandTerm):
             )
         self.desired_contact_states = torch.stack(smoothing, dim=1)
 
+        if self.cfg.enable_planted_gait and self.is_planted_env.any():
+            self.desired_contact_states[self.is_planted_env] = 1.0
+
+
+def _frequency_base_range(cfg: GaitBehaviorCommandCfg) -> tuple[float, float]:
+    """Return ``(lo, hi)`` for sampling per-env ``frequency_base``."""
+    freq_base = cfg.frequency_base
+    if freq_base is None:
+        return cfg.ranges.frequency
+    if isinstance(freq_base, (tuple, list)):
+        return (float(freq_base[0]), float(freq_base[1]))
+    return (float(freq_base), float(freq_base))
+
 
 @configclass
 class GaitBehaviorCommandCfg(CommandTermCfg):
@@ -143,6 +204,15 @@ class GaitBehaviorCommandCfg(CommandTermCfg):
 
     asset_name: str = "robot"
     kappa_gait_probs: float = 0.07
+    # When set, frequency tracks |vy| and |yaw| (rad/s) each step.
+    velocity_command_name: str | None = None
+    # Scalar, ``(lo, hi)`` range, or None → ``ranges.frequency``. Resampled per env.
+    frequency_base: float | tuple[float, float] | None = None
+    frequency_vy_scale: float = 0.5
+    frequency_yaw_scale: float = 0.5
+    # When True, |vy| and |yaw| below cmd_threshold force footswing=0 and all-stance.
+    enable_planted_gait: bool = False
+    cmd_threshold: float = 0.05
 
     @configclass
     class Ranges:

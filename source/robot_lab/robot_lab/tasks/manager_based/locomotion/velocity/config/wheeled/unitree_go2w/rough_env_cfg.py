@@ -20,12 +20,12 @@ from robot_lab.assets.unitree import UNITREE_GO2W_CFG  # isort: skip
 
 # Observation delay in policy steps (control_dt = sim.dt * decimation ≈ 0.02 s).
 _OBS_DELAY_MIN_LAG = 0
-_OBS_DELAY_MAX_LAG = 4  # up to ~80 ms
+_OBS_DELAY_MAX_LAG = 1  # up to ~20 ms
 # Constant per-episode additive gyro bias (rad/s), sampled at reset.
 _GYRO_BIAS_RANGE = (-0.05, 0.05)
 # Actuator PD gain scale DR relative to asset defaults (legs kp=50, kd=2).
-_ACTUATOR_STIFFNESS_SCALE = (0.8, 1.25)
-_ACTUATOR_DAMPING_SCALE = (0.8, 1.25)
+_ACTUATOR_STIFFNESS_SCALE = (0.9, 1.1)
+_ACTUATOR_DAMPING_SCALE = (0.9, 1.1)
 
 
 @configclass
@@ -156,9 +156,9 @@ class UnitreeGo2WRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
                 "x": (-0.5, 0.5),
                 "y": (-0.5, 0.5),
                 "z": (0.0, 0.2),
-                "roll": (-3.14, 3.14),
-                "pitch": (-3.14, 3.14),
-                "yaw": (-3.14, 3.14),
+                "roll": (-0, 0),
+                "pitch": (-0, 0),
+                "yaw": (-0, 0),
             },
             "velocity_range": {
                 "x": (-0.5, 0.5),
@@ -214,6 +214,8 @@ class UnitreeGo2WRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.stand_still.params["asset_cfg"].joint_names = self.leg_joint_names
         self.rewards.joint_pos_penalty.weight = -1.0
         self.rewards.joint_pos_penalty.params["asset_cfg"].joint_names = self.leg_joint_names
+        self.rewards.joint_pos_penalty.params["command_threshold"] = 0.05
+        self.rewards.joint_pos_penalty.params["full_stand_still_scale"] = 10.0
         self.rewards.wheel_vel_penalty.weight = 0
         self.rewards.wheel_vel_penalty.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.wheel_vel_penalty.params["asset_cfg"].joint_names = self.wheel_joint_names

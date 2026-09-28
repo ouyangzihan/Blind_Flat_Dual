@@ -73,6 +73,12 @@ parser.add_argument(
     default=0.5,
     help="Multiplier applied to switch thresholds when exiting leg policy.",
 )
+parser.add_argument(
+    "--obs_delay",
+    action="store_true",
+    default=False,
+    help="Keep training observation-delay modifiers. Default: disable delay to match rl_sar deploy.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -115,7 +121,6 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
-from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
@@ -153,6 +158,55 @@ def _create_runner(env, agent_cfg: RslRlBaseRunnerCfg):
     if agent_cfg.class_name == "DistillationRunner":
         return DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+
+
+def _checkpoint_mlp_in_dims(path: str) -> tuple[int | None, int | None]:
+    """Return (actor_in, critic_in) from an RSL-RL checkpoint first Linear layer."""
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location="cpu")
+    state = ckpt.get("model_state_dict", ckpt.get("model", ckpt))
+    if not isinstance(state, dict):
+        return None, None
+    actor_in = None
+    critic_in = None
+    for key, value in state.items():
+        if not hasattr(value, "ndim") or value.ndim != 2:
+            continue
+        if key.endswith("actor.0.weight"):
+            actor_in = int(value.shape[1])
+        elif key.endswith("critic.0.weight"):
+            critic_in = int(value.shape[1])
+    return actor_in, critic_in
+
+
+class _ObsPrefixEnv:
+    """Present a prefix of concatenated obs so a narrower checkpoint can load/run."""
+
+    def __init__(self, env, num_obs: int, num_privileged_obs: int | None = None):
+        object.__setattr__(self, "_env", env)
+        object.__setattr__(self, "num_obs", num_obs)
+        if num_privileged_obs is not None:
+            object.__setattr__(self, "num_privileged_obs", num_privileged_obs)
+
+    def get_observations(self):
+        return _adapt_obs_dim(self._env.get_observations(), self.num_obs)
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+
+
+def _adapt_obs_dim(obs, in_dim: int | None):
+    """Prefix-slice concatenated policy obs when the env is wider than the policy."""
+    if in_dim is None or not torch.is_tensor(obs) or obs.shape[-1] == in_dim:
+        return obs
+    if obs.shape[-1] > in_dim:
+        return obs[..., :in_dim]
+    raise RuntimeError(
+        f"Policy expects obs dim {in_dim} but env provided {obs.shape[-1]}. "
+        "Train/play this policy in an env that includes its observation terms."
+    )
 
 
 def _uses_leg_policy(vy: float, wz: float, active_leg_policy: bool) -> bool:
@@ -198,6 +252,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.scene.terrain.terrain_generator.curriculum = False
 
     env_cfg.observations.policy.enable_corruption = False
+    if not args_cli.obs_delay:
+        for term_name in ("base_ang_vel", "projected_gravity", "joint_pos", "joint_vel"):
+            term = getattr(env_cfg.observations.policy, term_name, None)
+            if term is not None:
+                term.modifiers = None
+        print("[INFO]: Observation delay modifiers disabled (pass --obs_delay to restore training delay).")
     env_cfg.events.randomize_apply_external_force_torque = None
     env_cfg.events.push_robot = None
     env_cfg.curriculum.command_levels_lin_vel = None
@@ -208,15 +268,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.scene.num_envs = 1
         env_cfg.terminations.time_out = None
         env_cfg.commands.base_velocity.debug_vis = False
+        env_cfg.commands.base_velocity.resampling_time_range = (1.0e9, 1.0e9)
+        if getattr(env_cfg.commands, "gait_behavior", None) is not None:
+            env_cfg.commands.gait_behavior.resampling_time_range = (1.0e9, 1.0e9)
+        # Wheels env zeros vy/wz command ranges (x-only training); use legs ranges for keyboard.
+        legs_env_cfg = load_cfg_from_registry(legs_task, "env_cfg_entry_point")
+        legs_ranges = legs_env_cfg.commands.base_velocity.ranges
+        vy_sensitivity = max(abs(legs_ranges.lin_vel_y[0]), abs(legs_ranges.lin_vel_y[1]))
+        wz_sensitivity = max(abs(legs_ranges.ang_vel_z[0]), abs(legs_ranges.ang_vel_z[1]))
         config = Se2KeyboardCfg(
             v_x_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_x[1],
-            v_y_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_y[1],
-            omega_z_sensitivity=env_cfg.commands.base_velocity.ranges.ang_vel_z[1],
+            v_y_sensitivity=vy_sensitivity,
+            omega_z_sensitivity=wz_sensitivity,
+        )
+        print(
+            f"[INFO]: Keyboard sensitivities vx={config.v_x_sensitivity}, "
+            f"vy={config.v_y_sensitivity}, wz={config.omega_z_sensitivity}"
         )
         controller = Se2Keyboard(config)
-        env_cfg.observations.policy.velocity_commands = ObsTerm(
-            func=lambda env: torch.tensor(controller.advance(), dtype=torch.float32).unsqueeze(0).to(env.device),
-        )
 
     wheels_checkpoint = _resolve_checkpoint(
         args_cli.checkpoint_wheels,
@@ -254,15 +323,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     env = RslRlVecEnvWrapper(env, clip_actions=wheels_agent_cfg.clip_actions)
 
+    wheels_actor_dim, wheels_critic_dim = _checkpoint_mlp_in_dims(wheels_checkpoint)
+    legs_actor_dim, legs_critic_dim = _checkpoint_mlp_in_dims(legs_checkpoint)
+    wheels_env = env if wheels_actor_dim is None else _ObsPrefixEnv(env, wheels_actor_dim, wheels_critic_dim)
+    legs_env = env if legs_actor_dim is None else _ObsPrefixEnv(env, legs_actor_dim, legs_critic_dim)
+
     print(f"[INFO]: Loading wheels policy from: {wheels_checkpoint}")
-    wheels_runner = _create_runner(env, wheels_agent_cfg)
+    wheels_runner = _create_runner(wheels_env, wheels_agent_cfg)
     wheels_runner.load(wheels_checkpoint)
     wheels_policy = wheels_runner.get_inference_policy(device=env.unwrapped.device)
 
     print(f"[INFO]: Loading leg-raising policy from: {legs_checkpoint}")
-    legs_runner = _create_runner(env, legs_agent_cfg)
+    legs_runner = _create_runner(legs_env, legs_agent_cfg)
     legs_runner.load(legs_checkpoint)
     legs_policy = legs_runner.get_inference_policy(device=env.unwrapped.device)
+    wheels_obs_dim = wheels_actor_dim
+    legs_obs_dim = legs_actor_dim
 
     dt = env.unwrapped.step_dt
     obs = env.get_observations()
@@ -275,6 +351,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             if controller is not None:
                 command = controller.advance()
+                command_tensor = env.unwrapped.command_manager.get_command("base_velocity")
+                command_tensor[:] = torch.tensor(command, dtype=command_tensor.dtype, device=command_tensor.device)
                 vy = float(command[1])
                 wz = float(command[2])
             else:
@@ -289,7 +367,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"[INFO]: Switched to {active_policy_name} policy.")
 
             policy = legs_policy if use_legs else wheels_policy
-            actions = policy(obs)
+            policy_obs = _adapt_obs_dim(obs, legs_obs_dim if use_legs else wheels_obs_dim)
+            actions = policy(policy_obs)
             obs, _, dones, _ = env.step(actions)
 
             if version.parse(installed_version) >= version.parse("4.0.0"):

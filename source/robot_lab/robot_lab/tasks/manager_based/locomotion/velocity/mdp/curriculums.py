@@ -105,8 +105,56 @@ def reward_weight_linear_decay(
     start_scale: float = 1.5,
     num_iterations: int = 500,
     steps_per_iteration: int = 24,
+    second_decay_start_iteration: int | None = None,
+    second_decay_iterations: int = 1000,
+    second_end_scale: float = 0.5,
 ) -> float:
     """Linearly decay a reward term weight from ``start_scale * target_weight`` to ``target_weight``.
+
+    The schedule is indexed by PPO learning iterations via ``env.common_step_counter`` and
+    ``steps_per_iteration`` (typically ``num_steps_per_env`` from the runner config).
+
+    If ``second_decay_start_iteration`` is set, the weight holds at ``target_weight`` until
+    that iteration, then linearly decays to ``second_end_scale * target_weight`` over
+    ``second_decay_iterations``.
+    """
+    del env_ids  # unused; curriculum is shared across all parallel environments
+
+    num_steps = num_iterations * steps_per_iteration
+    if env.common_step_counter >= num_steps:
+        scale = 1.0
+    else:
+        progress = env.common_step_counter / num_steps
+        scale = start_scale + (1.0 - start_scale) * progress
+
+    if second_decay_start_iteration is not None:
+        second_start_steps = second_decay_start_iteration * steps_per_iteration
+        second_decay_steps = second_decay_iterations * steps_per_iteration
+        if env.common_step_counter >= second_start_steps + second_decay_steps:
+            scale = second_end_scale
+        elif env.common_step_counter >= second_start_steps:
+            progress = (env.common_step_counter - second_start_steps) / second_decay_steps
+            scale = 1.0 + (second_end_scale - 1.0) * progress
+
+    weight = target_weight * scale
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    if term_cfg.weight != weight:
+        term_cfg.weight = weight
+        env.reward_manager.set_term_cfg(term_name, term_cfg)
+
+    return weight
+
+
+def reward_weight_linear_ramp(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    target_weight: float,
+    start_scale: float = 0.0,
+    num_iterations: int = 500,
+    steps_per_iteration: int = 24,
+) -> float:
+    """Linearly ramp a reward term weight from ``start_scale * target_weight`` to ``target_weight``.
 
     The schedule is indexed by PPO learning iterations via ``env.common_step_counter`` and
     ``steps_per_iteration`` (typically ``num_steps_per_env`` from the runner config).
@@ -129,18 +177,19 @@ def reward_weight_linear_decay(
     return weight
 
 
-def reward_weight_linear_ramp(
+def footswing_height_linear_ramp(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
-    term_name: str,
-    target_weight: float,
-    num_iterations: int = 500,
+    command_name: str = "gait_behavior",
+    target_range: tuple[float, float] = (0.05, 0.05),
+    start_scale: float = 0.2,
+    num_iterations: int = 1000,
     steps_per_iteration: int = 24,
 ) -> float:
-    """Linearly ramp a reward term weight from 0 to ``target_weight``.
+    """Linearly ramp gait ``footswing_height`` from ``start_scale * target`` to ``target``.
 
-    The schedule is indexed by PPO learning iterations via ``env.common_step_counter`` and
-    ``steps_per_iteration`` (typically ``num_steps_per_env`` from the runner config).
+    Updates ``command_manager`` range and live ``_nominal_footswing`` so the clearance
+    target tracks the schedule immediately (not only on the next command resample).
     """
     del env_ids  # unused; curriculum is shared across all parallel environments
 
@@ -148,12 +197,28 @@ def reward_weight_linear_ramp(
     if env.common_step_counter >= num_steps:
         scale = 1.0
     else:
-        scale = env.common_step_counter / num_steps
+        progress = env.common_step_counter / num_steps
+        scale = start_scale + (1.0 - start_scale) * progress
 
-    weight = target_weight * scale
-    term_cfg = env.reward_manager.get_term_cfg(term_name)
-    if term_cfg.weight != weight:
-        term_cfg.weight = weight
-        env.reward_manager.set_term_cfg(term_name, term_cfg)
+    new_lo = target_range[0] * scale
+    new_hi = target_range[1] * scale
+    gait_cmd = env.command_manager.get_term(command_name)
+    ranges = gait_cmd.cfg.ranges
+    cur = ranges.footswing_height
+    if cur[0] != new_lo or cur[1] != new_hi:
+        ranges.footswing_height = (new_lo, new_hi)
+        if hasattr(gait_cmd, "_nominal_footswing"):
+            if abs(new_hi - new_lo) < 1.0e-12:
+                gait_cmd._nominal_footswing[:] = new_lo
+            else:
+                # Preserve relative position in the previous range when both ends move.
+                old_span = cur[1] - cur[0]
+                if abs(old_span) < 1.0e-12:
+                    frac = 0.5
+                else:
+                    frac = ((gait_cmd._nominal_footswing - cur[0]) / old_span).clamp(0.0, 1.0)
+                gait_cmd._nominal_footswing[:] = new_lo + frac * (new_hi - new_lo)
+            if hasattr(gait_cmd, "_sync_velocity_modulated_params"):
+                gait_cmd._sync_velocity_modulated_params()
 
-    return weight
+    return new_hi

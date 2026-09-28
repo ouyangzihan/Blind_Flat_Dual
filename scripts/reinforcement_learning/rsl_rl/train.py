@@ -85,6 +85,7 @@ from datetime import datetime
 
 import gymnasium as gym
 import torch
+from entropy_schedule import install_entropy_coef_schedule
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -215,6 +216,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+
+    entropy_coef_late = getattr(agent_cfg, "entropy_coef_late", None)
+    entropy_drop_iteration = getattr(agent_cfg, "entropy_drop_iteration", None)
+    if entropy_coef_late is not None and entropy_drop_iteration is not None:
+        install_entropy_coef_schedule(
+            runner,
+            early=float(agent_cfg.algorithm.entropy_coef),
+            late=float(entropy_coef_late),
+            drop_iteration=int(entropy_drop_iteration),
+        )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

@@ -33,3 +33,16 @@ def phase(env: ManagerBasedRLEnv, cycle_time: float) -> torch.Tensor:
     phase = env.episode_length_buf[:, None] * env.step_dt / cycle_time
     phase_tensor = torch.cat([torch.sin(2 * torch.pi * phase), torch.cos(2 * torch.pi * phase)], dim=-1)
     return phase_tensor
+
+
+def gait_clock(env: ManagerBasedEnv, command_name: str = "gait_behavior") -> torch.Tensor:
+    """Sin/cos of each foot gait phase. Order [FL, FR, RL, RR] then cos of the same."""
+    gait_cmd = env.command_manager.get_term(command_name)
+    phase = 2.0 * torch.pi * gait_cmd.foot_indices
+    return torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
+
+
+def gait_footswing(env: ManagerBasedEnv, command_name: str = "gait_behavior") -> torch.Tensor:
+    """Commanded footswing height (m), already zeroed in planted gait."""
+    gait_cmd = env.command_manager.get_term(command_name)
+    return gait_cmd.command[:, 6:7]
